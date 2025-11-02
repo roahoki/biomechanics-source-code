@@ -1,0 +1,10 @@
+Python:
+numpy
+mido
+pyserial
+scipy
+pythonosc
+
+Processing:
+oscP5
+controlP5
