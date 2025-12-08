@@ -1,10 +1,14 @@
+Para correr los codigos, se necesitan algunas librerías.
+
 Python:
-numpy
-mido
-pyserial
-scipy
-pythonosc
+    umpy
+    mido
+    pyserial
+    scipy
+    pythonosc
 
 Processing:
-oscP5
-controlP5
+    oscP5
+    controlP5
+
+Falta actualizar esta lista :)
