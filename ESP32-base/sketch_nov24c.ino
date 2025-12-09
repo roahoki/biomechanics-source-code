@@ -3,13 +3,13 @@
 #include "DHT.h"
 
 // wifi credentials
-const char ssid[] = "Depto 701";
-const char pass[] = "Dperalta92";
+const char ssid[] = "@&*#!^*&";
+const char pass[] = "!@OIU#O!@U#";
 
 // Shiftr.io credentials / MQTT en Touchdesigner
-const char mqtt_client_id[] = "ESP32_Bioplant";
-const char mqtt_user[]      = "biomechanics-home";
-const char mqtt_pass[]      = "du8bKKeWl3mLh3pZ"; // Tus credenciales de Shiftr
+const char mqtt_client_id[] = "123)(*!@)#(*";
+const char mqtt_user[]      = "!#!@I#!@*#-!@()#*!";
+const char mqtt_pass[]      = "*#^&!*!"; // Tus credenciales de Shiftr. Privado
 
 // Configuración del Sensor
 #define DHTPIN 4     // El cable amarillo va al Pin D4
