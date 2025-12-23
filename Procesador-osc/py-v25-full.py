@@ -68,11 +68,18 @@ use_ppg = use_gyro = use_jaw = False
 baseline_duration_seconds = 10
 
 def list_available_csv_files():
-    """Lista archivos CSV disponibles en el directorio del script"""
+    """Lista archivos CSV disponibles en registros-meditacion"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_files = [f for f in os.listdir(script_dir) if f.endswith('.csv') and f.startswith('meditacion_')]
+    parent_dir = os.path.dirname(script_dir)
+    registros_dir = os.path.join(parent_dir, 'registros-meditacion')
+    
+    # Si la carpeta no existe, retorna lista vacía
+    if not os.path.exists(registros_dir):
+        return [], registros_dir
+    
+    csv_files = [f for f in os.listdir(registros_dir) if f.endswith('.csv') and f.startswith('meditacion_')]
     csv_files.sort(reverse=True)
-    return csv_files, script_dir
+    return csv_files, registros_dir
 
 def get_csv_info(csv_path):
     """Obtiene número de líneas y duración del CSV"""
