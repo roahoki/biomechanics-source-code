@@ -25,7 +25,7 @@ float accX=0, accY=0, accZ=0;
 
 // Variables Visualización
 // float t_noise = 0; // No se usa con ruido 3D
-public float deformationFactor = 0.7;
+public float deformationFactor = 0.45; // Reducido para superficie más suave
 ArrayList<Particle> particles;
 public float maxParticleLife = 1.0;
 public int numNewParticlesPerFrame = 50;
@@ -35,10 +35,42 @@ public float sensitivity = 2.25;
 
 // Auto-Reset y Heartbeat
 long nextResetTime; long randomInterval; boolean autoResetActive = false;
-long lastDataTime; long dataTimeout = 1000; boolean isConnected = false;
+long lastDataTime; long dataTimeout = 2000; boolean isConnected = false;
+
+// Estética y exportación para póster vertical
+boolean posterMode = true; // Activa formato póster vertical
+boolean saveFrames = false; // Activar para exportar PNG
+String framePath = "frames/frame-####.png";
+int posterWidth = 3600;  // Relación 2:3
+int posterHeight = 5400;
+float bgHue = 210; float bgSat = 10; float bgBrightTop = 16; float bgBrightBottom = 6; // Más contraste
+float vignetteStrength = 0.0; // 0-1 (0 para sin viñeta)
+int sphereSegments = 128; // Más detalle para impresión (aumentado para suavidad)
+float solidAlpha = 100; float wireAlpha = 70; float wireStroke = 0.9;
+float cameraOrbitAmp = 0.08; // Giro leve de cámara
+boolean showUI = true; // Mostrar sliders y HUD incluso en modo póster
+boolean showWireframe = true; // Mostrar/ocultar líneas blancas (toggle con 'w')
+
+// Tipografía
+String jetFontPath = "/Users/tomas/Downloads/JetBrainsMono-2.304/fonts/ttf/JetBrainsMono-Regular.ttf";
+PFont uiFont; PFont hudFont;
+int textSizeUI = 12; // Tamaño uniforme para UI y HUD
+
+// Límite de partículas para evitar memory leak
+public int maxParticlesAllowed = 5000;
+
+void settings() {
+  if (posterMode) {
+    float aspect = posterWidth / (float)posterHeight;
+    int hFit = displayHeight; // ocupar el alto de la pantalla
+    int wFit = (int)(hFit * aspect); // respetar relación 2:3
+    size(wFit, hFit, P3D);
+  } else {
+    size(1400, 900, P3D); // Vista cómoda en pantalla estándar
+  }
+}
 
 void setup() {
-  fullScreen(P3D, 2);
 
   oscP5 = new OscP5(this, 5002);
   cp5 = new ControlP5(this);
@@ -52,8 +84,11 @@ void setup() {
   particles = new ArrayList<Particle>();
 
   // --- Sliders (Layout v31) ---
-  int sliderX = 20; int sliderY = 20; int sliderW = 180; int sliderH = 20; int sliderSpacingY = 30; int currentY = sliderY;
-  PFont sliderFont = createFont("Arial", 14); ControlFont cf = new ControlFont(sliderFont); cp5.setFont(cf);
+  uiFont = createFont(jetFontPath, 8);
+  hudFont = createFont(jetFontPath, 8);
+
+  int sliderX = 20; int sliderY = 20; int sliderW = 220; int sliderH = 18; int sliderSpacingY = 28; int currentY = sliderY;
+  ControlFont cf = new ControlFont(uiFont); cp5.setFont(cf);
   cp5.addSlider("muDelta").setPosition(sliderX, currentY).setSize(sliderW,sliderH).setRange(0.1, 3.0).setValue(muDelta).setLabel("Mu Delta"); currentY += sliderSpacingY;
   cp5.addSlider("muTheta").setPosition(sliderX, currentY).setSize(sliderW,sliderH).setRange(0.1, 2.5).setValue(muTheta).setLabel("Mu Theta"); currentY += sliderSpacingY;
   cp5.addSlider("muAlpha").setPosition(sliderX, currentY).setSize(sliderW,sliderH).setRange(0.1, 2.5).setValue(muAlpha).setLabel("Mu Alpha"); currentY += sliderSpacingY;
@@ -75,14 +110,18 @@ void setup() {
   randomInterval = (long)random(3000, 7000);
   nextResetTime = millis() + randomInterval;
   lastDataTime = millis();
+
+  if (posterMode) {
+    randomSeed(1); noiseSeed(1); // Consistencia entre renders
+  }
 }
 
 void draw() {
   // Comprobación Heartbeat
-  if (!isConnected ) { background(0); fill(0,0,100,60);textSize(24);textAlign(CENTER,CENTER);text("ESPERANDO CONEXIÓN...",width/2,height/2);nextResetTime=millis()+randomInterval;return;}
+  if (!isConnected ) { background(0); textFont(hudFont); fill(0,0,100,60);textSize(textSizeUI);textAlign(CENTER,CENTER);text("ESPERANDO CONEXIÓN...",width/2,height/2);nextResetTime=millis()+randomInterval;return;}
   if (millis() - lastDataTime > dataTimeout) { println("!!! CONEXIÓN PERDIDA !!!"); isConnected = false; return; }
 
-  background(0); // Borrado total
+  background(bgHue, bgSat, bgBrightTop); // Limpiar frame anterior
 
   // Validar valores OSC
   float safe_sAvgAlpha = validateFloat(s_avgAlpha, 0.0f);
@@ -91,6 +130,7 @@ void draw() {
   float safe_sAvgGamma = validateFloat(s_avgGamma, 0.0f);
   float safe_avgAlpha = validateFloat(avgAlpha, 1.0f);
   float safe_avgDelta = validateFloat(avgDelta, 0.0f);
+  float safe_avgBeta = validateFloat(avgBeta, 0.0f); // Para offset de radio de partículas
   float safe_accX = validateFloat(accX, 0.0f);
   float safe_accY = validateFloat(accY, 0.0f);
   float safe_accZ = validateFloat(accZ, 0.0f);
@@ -99,13 +139,13 @@ void draw() {
   float noiseBaseScale = 1.0;
   float thetaScaleFactor = map(safe_sAvgTheta, -2.0, 2.0, 0.5, 1.5);
   float currentNoiseScale = noiseBaseScale * lerp(1.0, thetaScaleFactor, infThetaScale);
-  float safeNoiseScale = max(0.01, currentNoiseScale);
+  float safeNoiseScale = constrain(currentNoiseScale, 0.01, 0.5); // Limitar para deformación controlada
 
   float alphaAmpFactor = map(safe_sAvgAlpha, -2.0, 2.0, 0.5, 1.5);
   float currentAmplitude = deformationFactor * lerp(1.0, alphaAmpFactor, infAlphaAmp);
 
-  float orden = map(safe_avgAlpha, 0, 3.0, 8, 2);
-  noiseDetail(max(1, int(orden)));
+  // Fijar detalle de ruido para evitar parpadeos y suavizar deformación
+  noiseDetail(7, 0.70);
 
   // --- Mundo 3D ---
   pushMatrix();
@@ -113,6 +153,8 @@ void draw() {
   float rotX = map(safe_accY, -1.0, 1.0, PI * sensitivity, -PI * sensitivity); // Pitch
   float rotY = map(safe_accZ, -1.0, 1.0, -PI * sensitivity, PI * sensitivity); // Yaw
   float rotZ = map(safe_accX, -1.0, 1.0, -PI * sensitivity, PI * sensitivity); // Roll
+  float orbit = sin(frameCount * 0.0025) * cameraOrbitAmp;
+  rotateY(orbit);
   rotateX(rotX); rotateY(rotY); rotateZ(rotZ);
 
   // --- CAMBIO 2: Añadir Iluminación ---
@@ -120,47 +162,60 @@ void draw() {
   // -----------------------------------
 
   // --- DIBUJO DE LA SUPERFICIE SÓLIDA ---
-  float radioPerfecto = map(muAlpha, 0.1, 2.5, height * 0.25, height * 0.40);
-  int sphereSegments = 24;
+  float baseDim = min(width, height);
+  float radioPerfecto = map(muAlpha, 0.1, 2.5, baseDim * 0.25, baseDim * 0.45);
   
   // Calcular color base para la esfera sólida
   float alphaColorFactor = constrain(map(safe_sAvgAlpha, -2.0, 2.0, 0.0, 1.0), 0.0, 1.0);
   float sphereHue = lerp(120, 240, alphaColorFactor); // Verde-Azul
   
   // --- CAMBIO 1 y 4: Estilo Sólido ---
-  fill(sphereHue, 50, 80, 100); // HSB: Color dinámico, Sat 50, Bri 80, Op 100
-  noStroke(); // Sin malla de alambre
-  // ---------------------------------
-
+  fill(sphereHue, 50, 80, solidAlpha); // Mantener saturación/brillo originales
+  noStroke();
   drawDeformedSphereSolid(radioPerfecto, sphereSegments, safeNoiseScale, currentAmplitude);
-  // -------------------------------------
+
+  // Capa wireframe blanca (opcional)
+  if (showWireframe) {
+    stroke(0, 0, 100, wireAlpha);
+    strokeWeight(wireStroke);
+    noFill();
+    drawDeformedSphereWire(radioPerfecto, sphereSegments, safeNoiseScale, currentAmplitude);
+  }
 
   noLights(); // Apagar luces para que no afecten a las partículas
 
   // --- Crear Nuevas Partículas ---
-  for (int i = 0; i < numNewParticlesPerFrame; i++) {
-    float u = random(TWO_PI); float v = random(-1.0, 1.0);
-    float angleTheta = acos(v); float anglePhi = u;
+  // Limitar el total de partículas para evitar memory leak
+  if (particles.size() < maxParticlesAllowed) {
+    for (int i = 0; i < numNewParticlesPerFrame; i++) {
+      if (particles.size() >= maxParticlesAllowed) break; // Detener si se alcanza el límite
+      
+      float u = random(TWO_PI); float v = random(-1.0, 1.0);
+      float angleTheta = acos(v); float anglePhi = u;
 
-    float xBase = radioPerfecto * sin(angleTheta) * cos(anglePhi);
-    float yBase = radioPerfecto * sin(angleTheta) * sin(anglePhi);
-    float zBase = radioPerfecto * cos(angleTheta);
+      float xBase = radioPerfecto * sin(angleTheta) * cos(anglePhi);
+      float yBase = radioPerfecto * sin(angleTheta) * sin(anglePhi);
+      float zBase = radioPerfecto * cos(angleTheta);
 
-    float noiseInputX = validateFloat(xBase * safeNoiseScale, 0.0f);
-    float noiseInputY = validateFloat(yBase * safeNoiseScale, 0.0f);
-    float noiseInputZ = validateFloat(zBase * safeNoiseScale, 0.0f);
+      float noiseInputX = validateFloat(xBase * safeNoiseScale, 0.0f);
+      float noiseInputY = validateFloat(yBase * safeNoiseScale, 0.0f);
+      float noiseInputZ = validateFloat(zBase * safeNoiseScale, 0.0f);
 
-    float n = noise(noiseInputX, noiseInputY, noiseInputZ); // Ruido 3D
-    float safeN = validateFloat(n, 0.5f);
+      float n = noise(noiseInputX, noiseInputY, noiseInputZ); // Ruido 3D
+      float safeN = validateFloat(n, 0.5f);
 
-    float deformacion = map(safeN, 0, 1, -radioPerfecto * currentAmplitude, radioPerfecto * currentAmplitude);
-    float radioDinamico = radioPerfecto + deformacion; // Radio para la partícula
+      float deformacion = map(safeN, 0, 1, -radioPerfecto * currentAmplitude, radioPerfecto * currentAmplitude);
+      float radioDinamico = radioPerfecto + deformacion; // Radio para la partícula
+      
+      // Offset variable basado en avgBeta: partículas pueden nacer más lejos/cerca de superficie
+      float betaOffset = map(safe_avgBeta, 0, 3.0, -radioPerfecto * 0.1, radioPerfecto * 0.15);
+      radioDinamico += betaOffset;
 
-    float xPos = radioDinamico * sin(angleTheta) * cos(anglePhi);
-    float yPos = radioDinamico * sin(angleTheta) * sin(anglePhi);
-    float zPos = radioDinamico * cos(angleTheta);
+      float xPos = radioDinamico * sin(angleTheta) * cos(anglePhi);
+      float yPos = radioDinamico * sin(angleTheta) * sin(anglePhi);
+      float zPos = radioDinamico * cos(angleTheta);
 
-    if (isValidPosition(xPos, yPos, zPos)) {
+      if (isValidPosition(xPos, yPos, zPos)) {
       float p_alphaColorFactor = constrain(map(safe_sAvgAlpha, -2.0, 2.0, 0.0, 1.0), 0.0, 1.0);
       float p_hueBase = lerp(120, 240, p_alphaColorFactor);
       float p_saturation = constrain(map(safe_sAvgBeta, -2.0, 2.0, 20, 100), 0, 100);
@@ -175,9 +230,9 @@ void draw() {
       }
     }
   }
+  }
 
   // --- Dibujar y Envejecer Partículas ---
-  // (Sin cambios)
   for (int i = particles.size() - 1; i >= 0; i--) {
     Particle p = particles.get(i);
     if (p == null || p.pos == null) { particles.remove(i); continue; }
@@ -189,29 +244,34 @@ void draw() {
   popMatrix(); // --- Fin mundo 3D ---
 
   // --- DIBUJAR HUD y SLIDERS ---
-  hint(DISABLE_DEPTH_TEST);
-  fill(0, 0, 100, 80); textSize(16); textAlign(RIGHT, BOTTOM);
-  // ... (código HUD igual que v31) ...
-  String fsDelta = String.format("%+.2f", s_avgDelta); String fsTheta = String.format("%+.2f", s_avgTheta);
-  String fsAlpha = String.format("%+.2f", s_avgAlpha); String fsBeta = String.format("%+.2f", s_avgBeta);
-  String fsGamma = String.format("%+.2f", s_avgGamma); String fmuDelta = String.format("%.2f", muDelta);
-  String fmuTheta = String.format("%.2f", muTheta); String fmuAlpha = String.format("%.2f", muAlpha);
-  String fmuBeta = String.format("%.2f", muBeta); String fmuGamma = String.format("%.2f", muGamma);
-  String fAccX = String.format("%.2f", accX); String fAccY = String.format("%.2f", accY);
-  String fAccZ = String.format("%.2f", accZ); String fDeform = String.format("%.1f", deformationFactor * 100);
-  int x_hud = width - 20; int y_hud_base = height - 20; int hudSpacing = 25;
-  text("Deform: "+fDeform + "%", x_hud, y_hud_base); y_hud_base -= hudSpacing * 1.5;
-  text("sDELTA: "+fsDelta, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("sTHETA: "+fsTheta, x_hud, y_hud_base); y_hud_base -= hudSpacing;
-  text("sALPHA: "+fsAlpha, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("sBETA: "+fsBeta, x_hud, y_hud_base); y_hud_base -= hudSpacing;
-  text("sGAMMA: "+fsGamma, x_hud, y_hud_base); y_hud_base -= hudSpacing * 1.5;
-  text("AccX: "+fAccX, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("AccY: "+fAccY, x_hud, y_hud_base); y_hud_base -= hudSpacing;
-  text("AccZ: "+fAccZ, x_hud, y_hud_base); y_hud_base -= hudSpacing * 1.5;
-  text("muDEL: "+fmuDelta, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("muTHE: "+fmuTheta, x_hud, y_hud_base); y_hud_base -= hudSpacing;
-  text("muALP: "+fmuAlpha, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("muBET: "+fmuBeta, x_hud, y_hud_base); y_hud_base -= hudSpacing;
-  text("muGAM: "+fmuGamma, x_hud, y_hud_base);
+  if (showUI) {
+    hint(DISABLE_DEPTH_TEST);
+    textFont(hudFont);
+    fill(0, 0, 100, 85); textSize(textSizeUI); textAlign(RIGHT, BOTTOM);
+    String fsDelta = String.format("%+.2f", s_avgDelta); String fsTheta = String.format("%+.2f", s_avgTheta);
+    String fsAlpha = String.format("%+.2f", s_avgAlpha); String fsBeta = String.format("%+.2f", s_avgBeta);
+    String fsGamma = String.format("%+.2f", s_avgGamma); String fmuDelta = String.format("%.2f", muDelta);
+    String fmuTheta = String.format("%.2f", muTheta); String fmuAlpha = String.format("%.2f", muAlpha);
+    String fmuBeta = String.format("%.2f", muBeta); String fmuGamma = String.format("%.2f", muGamma);
+    String fAccX = String.format("%.2f", accX); String fAccY = String.format("%.2f", accY);
+    String fAccZ = String.format("%.2f", accZ); String fDeform = String.format("%.1f", deformationFactor * 100);
+    int x_hud = width - 20; int y_hud_base = height - 20; int hudSpacing = 25;
+    text("Deform: "+fDeform + "%", x_hud, y_hud_base); y_hud_base -= hudSpacing * 1.5;
+    text("sDELTA: "+fsDelta, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("sTHETA: "+fsTheta, x_hud, y_hud_base); y_hud_base -= hudSpacing;
+    text("sALPHA: "+fsAlpha, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("sBETA: "+fsBeta, x_hud, y_hud_base); y_hud_base -= hudSpacing;
+    text("sGAMMA: "+fsGamma, x_hud, y_hud_base); y_hud_base -= hudSpacing * 1.5;
+    text("AccX: "+fAccX, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("AccY: "+fAccY, x_hud, y_hud_base); y_hud_base -= hudSpacing;
+    text("AccZ: "+fAccZ, x_hud, y_hud_base); y_hud_base -= hudSpacing * 1.5;
+    text("muDEL: "+fmuDelta, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("muTHE: "+fmuTheta, x_hud, y_hud_base); y_hud_base -= hudSpacing;
+    text("muALP: "+fmuAlpha, x_hud, y_hud_base); y_hud_base -= hudSpacing; text("muBET: "+fmuBeta, x_hud, y_hud_base); y_hud_base -= hudSpacing;
+    text("muGAM: "+fmuGamma, x_hud, y_hud_base);
 
-  cp5.draw(); // Dibuja Sliders
-  hint(ENABLE_DEPTH_TEST);
+    cp5.draw(); // Dibuja Sliders
+    hint(ENABLE_DEPTH_TEST);
+  }
+
+  applyVignette();
+  if (saveFrames) { saveFrame(framePath); }
 
   // Auto-Reset
   if (autoResetActive && millis() > nextResetTime) {
@@ -220,8 +280,21 @@ void draw() {
   }
 }
 
+// --- Fondo degradado monocromo frío ---
+void drawBackgroundGradient() {
+  hint(DISABLE_DEPTH_TEST);
+  noStroke();
+  for (int y = 0; y < height; y++) {
+    float t = map(y, 0, height, 0, 1);
+    float b = lerp(bgBrightTop, bgBrightBottom, t);
+    fill(bgHue, bgSat, b, 0); // sin opacidad
+    rect(0, y, width, 1);
+  }
+  hint(ENABLE_DEPTH_TEST);
+}
+
 // --- oscEvent (sin cambios) ---
-void oscEvent(OscMessage theOscMessage) { /* ... */ lastDataTime = millis(); String addr = theOscMessage.addrPattern(); if (!isConnected && addr.startsWith("/py/")) {println(">>> CONEXIÓN ESTABLECIDA <<<"); isConnected = true;} try { if (addr.equals("/py/bands_env")) { if(theOscMessage.arguments().length==5){avgDelta=validateFloat(theOscMessage.get(0).floatValue(), avgDelta); avgTheta=validateFloat(theOscMessage.get(1).floatValue(), avgTheta); avgAlpha=validateFloat(theOscMessage.get(2).floatValue(), avgAlpha); avgBeta=validateFloat(theOscMessage.get(3).floatValue(), avgBeta); avgGamma=validateFloat(theOscMessage.get(4).floatValue(), avgGamma);}} else if (addr.equals("/py/bands_signed_env")) { if(theOscMessage.arguments().length==5){s_avgDelta = validateFloat(theOscMessage.get(0).floatValue(), s_avgDelta); s_avgTheta = validateFloat(theOscMessage.get(1).floatValue(), s_avgTheta); s_avgAlpha = validateFloat(theOscMessage.get(2).floatValue(), s_avgAlpha); s_avgBeta  = validateFloat(theOscMessage.get(3).floatValue(), s_avgBeta); s_avgGamma = validateFloat(theOscMessage.get(4).floatValue(), s_avgGamma);}} else if (addr.equals("/py/acc")) { if(theOscMessage.arguments().length==3){accX=validateFloat(theOscMessage.get(0).floatValue(), accX); accY=validateFloat(theOscMessage.get(1).floatValue(), accZ); accZ=validateFloat(theOscMessage.get(2).floatValue(), accZ);}} else if (addr.startsWith("/py/")) { } else if (addr.startsWith("/desdemuse/")) { } else { }} catch (Exception e) { println("!!! ERROR procesando OSC: " + addr + " - " + e); } }
+void oscEvent(OscMessage theOscMessage) { /* ... */ lastDataTime = millis(); String addr = theOscMessage.addrPattern(); if (!isConnected && addr.startsWith("/py/")) {println(">>> CONEXIÓN ESTABLECIDA <<<"); isConnected = true;} try { if (addr.equals("/py/bands_env")) { if(theOscMessage.arguments().length==5){avgDelta=validateFloat(theOscMessage.get(0).floatValue(), avgDelta); avgTheta=validateFloat(theOscMessage.get(1).floatValue(), avgTheta); avgAlpha=validateFloat(theOscMessage.get(2).floatValue(), avgAlpha); avgBeta=validateFloat(theOscMessage.get(3).floatValue(), avgBeta); avgGamma=validateFloat(theOscMessage.get(4).floatValue(), avgGamma);}} else if (addr.equals("/py/bands_signed_env")) { if(theOscMessage.arguments().length==5){s_avgDelta = validateFloat(theOscMessage.get(0).floatValue(), s_avgDelta); s_avgTheta = validateFloat(theOscMessage.get(1).floatValue(), s_avgTheta); s_avgAlpha = validateFloat(theOscMessage.get(2).floatValue(), s_avgAlpha); s_avgBeta  = validateFloat(theOscMessage.get(3).floatValue(), s_avgBeta); s_avgGamma = validateFloat(theOscMessage.get(4).floatValue(), s_avgGamma);}} else if (addr.equals("/py/acc")) { if(theOscMessage.arguments().length==3){accX=validateFloat(theOscMessage.get(0).floatValue(), accX); accY=validateFloat(theOscMessage.get(1).floatValue(), accY); accZ=validateFloat(theOscMessage.get(2).floatValue(), accZ);}} else if (addr.startsWith("/py/")) { } else if (addr.startsWith("/desdemuse/")) { } else { }} catch (Exception e) { println("!!! ERROR procesando OSC: " + addr + " - " + e); } }
 
 // --- Funciones de Validación (sin cambios) ---
 float validateFloat(float value, float defaultValue) { return (Float.isNaN(value) || Float.isInfinite(value)) ? defaultValue : value; }
@@ -236,6 +309,7 @@ void keyPressed() {
   if (key == 'r' || key == 'R') { resetVisuals(); }
   if (key == '+') { deformationFactor=constrain(deformationFactor+0.1,0.1,2.0); println("Deform:"+String.format("%.1f",deformationFactor)); cp5.getController("deformationFactor").setValue(deformationFactor);}
   if (key == '-') { deformationFactor=constrain(deformationFactor-0.1,0.1,2.0); println("Deform:"+String.format("%.1f",deformationFactor)); cp5.getController("deformationFactor").setValue(deformationFactor);}
+  if (key == 'w' || key == 'W') { showWireframe = !showWireframe; println("Wireframe " + (showWireframe?"VISIBLE":"OCULTO")); }
   if (key == 'a' || key == 'A') {
     autoResetActive = !autoResetActive; println("Auto-Reset " + (autoResetActive?"ACTIVADO":"DESACTIVADO"));
     if(autoResetActive){randomInterval = (long)random(3000, 7000); nextResetTime = millis() + randomInterval;}
@@ -263,6 +337,48 @@ class Particle {
         if (isValidPosition(pos.x, pos.y, pos.z)) { point(pos.x, pos.y, pos.z); }
     }
   }
+}
+
+// --- Wireframe compartiendo deformación ---
+void drawDeformedSphereWire(float radius, int segments, float noiseScale, float noiseAmplitude) {
+  for (int i = 0; i < segments; i++) {
+    float lat1 = map(i, 0, segments, 0, PI);
+    float lat2 = map(i+1, 0, segments, 0, PI);
+    beginShape(TRIANGLE_STRIP);
+    for (int j = 0; j <= segments; j++) {
+      float lon = map(j, 0, segments, 0, TWO_PI);
+      PVector p1 = deformPoint(radius, lat1, lon, noiseScale, noiseAmplitude);
+      PVector p2 = deformPoint(radius, lat2, lon, noiseScale, noiseAmplitude);
+      vertex(p1.x, p1.y, p1.z);
+      vertex(p2.x, p2.y, p2.z);
+    }
+    endShape();
+  }
+}
+
+// --- Helper para deformar un punto con ruido compartido ---
+PVector deformPoint(float radius, float lat, float lon, float noiseScale, float noiseAmplitude) {
+  float xBase = radius * sin(lat) * cos(lon);
+  float yBase = radius * sin(lat) * sin(lon);
+  float zBase = radius * cos(lat);
+  float n = noise(xBase * noiseScale, yBase * noiseScale, zBase * noiseScale);
+  float safeN = validateFloat(n, 0.5f);
+  float deformacion = map(safeN, 0, 1, -radius * noiseAmplitude, radius * noiseAmplitude);
+  float r = max(0.1, radius + deformacion);
+  return new PVector(r * sin(lat) * cos(lon), r * sin(lat) * sin(lon), r * cos(lat));
+}
+
+// --- Viñeta suave para enmarcar la esfera ---
+void applyVignette() {
+  hint(DISABLE_DEPTH_TEST);
+  noStroke();
+  int steps = 8;
+  for (int i = 0; i < steps; i++) {
+    float t = map(i, 0, steps-1, 0, 1);
+    fill(0, 0, 0, vignetteStrength * 100 * t);
+    rect(i, i, width - 2*i, height - 2*i);
+  }
+  hint(ENABLE_DEPTH_TEST);
 }
 
 // --- CAMBIO 1: NUEVA FUNCIÓN drawDeformedSphereSolid ---
@@ -313,6 +429,48 @@ void drawDeformedSphereSolid(float radius, int segments, float noiseScale, float
       normal.normalize();
       globeNormals[i][j] = normal;
       // -------------------------------
+    }
+  }
+
+  // --- SUAVIZADO LAPLACIANO ---
+  // Suavizar vértices promediando con vecinos para eliminar picos
+  for (int iter = 0; iter < 2; iter++) { // 2 iteraciones de suavizado
+    PVector[][] smoothGlobe = new PVector[segments + 1][segments + 1];
+    for (int i = 1; i < segments; i++) { // No suavizar polos
+      for (int j = 0; j <= segments; j++) {
+        PVector avg = new PVector(0, 0, 0);
+        // Promediar con 4 vecinos
+        avg.add(globe[i-1][j]);
+        avg.add(globe[i+1][j]);
+        avg.add(globe[i][(j-1+segments+1) % (segments+1)]);
+        avg.add(globe[i][(j+1) % (segments+1)]);
+        avg.div(4);
+        smoothGlobe[i][j] = PVector.lerp(globe[i][j], avg, 0.4); // Mezcla 40% suavizado
+      }
+    }
+    // Copiar polos sin suavizar
+    for (int j = 0; j <= segments; j++) {
+      smoothGlobe[0][j] = globe[0][j];
+      smoothGlobe[segments][j] = globe[segments][j];
+    }
+    globe = smoothGlobe;
+  }
+  // -------------------------
+
+  // Recalcular normales después del suavizado usando diferencias finitas
+  for (int i = 0; i <= segments; i++) {
+    for (int j = 0; j <= segments; j++) {
+      // Calcular normales con diferencias finitas entre vértices vecinos
+      PVector p_lat_plus = globe[min(i+1, segments)][j];
+      PVector p_lat_minus = globe[max(i-1, 0)][j];
+      PVector p_lon_plus = globe[i][(j+1) % (segments+1)];
+      PVector p_lon_minus = globe[i][j > 0 ? j-1 : segments];
+      
+      PVector dLat = PVector.sub(p_lat_plus, p_lat_minus);
+      PVector dLon = PVector.sub(p_lon_plus, p_lon_minus);
+      PVector normal = dLat.cross(dLon);
+      normal.normalize();
+      globeNormals[i][j] = normal;
     }
   }
 
