@@ -976,7 +976,12 @@ def muse_eeg(unused_addr, *args):
     global baseline_eeg_start_sent
     
     if len(args) < SRATE:
+        if debug_mode:
+            safe_print(f"⚠️ EEG: Datos insuficientes ({len(args)}/{SRATE})")
         return
+    
+    if not baseline_eeg_done and not baseline_eeg_start_sent:
+        safe_print("✓ Datos EEG recibidos del Muse!")
     
     seg = np.array(args[:SRATE], dtype=float)
     eeg_buf.extend(seg)
@@ -1029,7 +1034,12 @@ def muse_acc(unused_addr, *args):
     global baseline_acc_movement_start_sent, baseline_phase
     
     if len(args) < 3:
+        if debug_mode:
+            safe_print(f"⚠️ ACC: Datos insuficientes ({len(args)}/3)")
         return
+    
+    if not baseline_acc_neutral_done and not baseline_acc_neutral_start_sent:
+        safe_print("✓ Datos ACC recibidos del Muse!")
     
     ax, ay, az = float(args[0]), float(args[1]), float(args[2])
     acc['x'], acc['y'], acc['z'] = ax, ay, az
@@ -1099,10 +1109,15 @@ def muse_acc(unused_addr, *args):
 def muse_ppg(unused_addr, *args):
     """Handler para PPG del Muse"""
     if len(args) < 1:
+        if debug_mode:
+            safe_print("⚠️ PPG: Datos insuficientes")
         return
     
     ppg_val = float(args[0])
     ppg['raw'] = ppg_val
+    
+    if ppg['raw'] is None or debug_mode:
+        safe_print(f"✓ Datos PPG recibidos: {ppg_val}")
     
     if not pause_outputs:
         send_proc("/py/ppg/bpm", ppg_val)
@@ -1131,8 +1146,11 @@ def muse_jaw(unused_addr, *args):
 
 def catch_all_osc(unused_addr, *args):
     """Captura todos los mensajes OSC para debugging"""
-    if debug_mode:
-        print(f"[OSC RECEIVED] {unused_addr}: {args}")
+    # Mostrar todos los mensajes OSC si debug está activado
+    # O si aún no se ha completado el baseline (para ver qué está llegando)
+    if debug_mode or not baseline_done:
+        if not unused_addr.startswith('/muse/'):
+            print(f"[OSC DEBUG] Ruta desconocida: {unused_addr} | Datos: {args[:5] if len(args) > 5 else args}")
 
 # Registrar handlers
 disp = Dispatcher()
@@ -1154,11 +1172,22 @@ def live_loop():
     print("\n--- Iniciando servidor OSC ---")
     print(f"Esperando datos Muse en {MY_LOCAL_IP}:{OSC_PORT}\n")
     
-    server = BlockingOSCUDPServer((MY_LOCAL_IP, OSC_PORT), disp)
+    try:
+        server = BlockingOSCUDPServer((MY_LOCAL_IP, OSC_PORT), disp)
+        print(f"✓ Servidor OSC iniciado correctamente en {MY_LOCAL_IP}:{OSC_PORT}")
+        print(f"✓ Esperando conexión del dispositivo Muse...\n")
+    except Exception as e:
+        safe_print(f"❌ ERROR: No se pudo iniciar el servidor OSC: {e}")
+        safe_print(f"   Verifica que el puerto {OSC_PORT} no esté en uso por otra aplicación.")
+        return
     
     try:
+        request_count = 0
         while threads_active:
             server.handle_request()
+            request_count += 1
+            if request_count == 1:
+                print("✓ Primera conexión OSC recibida!\n")
     except KeyboardInterrupt:
         pass
     except Exception as e:

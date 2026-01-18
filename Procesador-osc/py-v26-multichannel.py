@@ -1,12 +1,11 @@
 1#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SCRIPT PYTHON (v24)
-- Mantiene Modo Simulador (Opción 0).
-- CORRECCIÓN: Restaurada la función 'open_midi()' que
-              fue eliminada por error en v23, causando
-              el 'name 'open_midi' is not defined'.
-- Mantiene estructura robusta try/except/finally y pausa final.
+SCRIPT PYTHON (v26-multichannel)
+- Extensión de v24 con soporte para procesar cada canal EEG del Muse 2 individualmente
+- Soporta 4 canales EEG: TP9, AF7, AF8, TP10
+- Procesa y envía datos de cada canal por separado
+- Mantiene compatibilidad con modo simulador y todas las funciones de v24
 """
 
 import sys
@@ -25,8 +24,11 @@ except ImportError as e: print(f"!!! ERROR: Falta librería: {e}\nInstala depend
 # --------------------
 
 # --- Pausa inicial ---
-print("Iniciando script python v24...")
-print("Esta ventana debería permanecer abierta.")
+print("="*60)
+print("  BIOMECHANICS OSC PROCESSOR v26-multichannel")
+print("  Soporte para 4 canales EEG individuales")
+print("="*60)
+print("Esta ventana debe permanecer abierta.\n")
 # --------------------
 
 # --- Funciones (get_local_ip, preguntar_bool - sin cambios) ---
@@ -50,6 +52,10 @@ def preguntar_bool(texto):
             return False
         else:
             print("❌ Valor no permitido. Ingresa 's' (sí) o 'n' (no).")
+
+# --- Canales EEG del Muse 2 ---
+EEG_CHANNELS = ['TP9', 'AF7', 'AF8', 'TP10']
+EEG_CHANNEL_INDICES = {ch: idx for idx, ch in enumerate(EEG_CHANNELS)}
 
 # Variables globales necesarias para show_main_menu
 is_simulation = False
@@ -83,6 +89,10 @@ def show_main_menu():
         print("\n" + "="*50 + "\n    CONFIG OSC\n"+f"    ► App Muse -> IP: {MY_LOCAL_IP} | Puerto: {OSC_PORT}\n"+"="*50 + "\n")
         print("--- Config Sensor Cerebral ---")
         use_eeg = preguntar_bool("¿Ondas?")
+        if use_eeg:
+            global eeg_processing_mode
+            eeg_processing_mode = 'individual' if preguntar_bool("¿Procesar canales individuales?") else 'average'
+            print(f"✓ Modo EEG: {eeg_processing_mode.upper()}")
         use_acc = preguntar_bool("¿Accel?")
         use_ppg = preguntar_bool("¿Heartbeat/PPG?")
         save_data = preguntar_bool("¿Guardar datos?")
@@ -128,6 +138,7 @@ is_simulation = False
 use_eeg = use_acc = use_ppg = use_gyro = use_jaw = use_myo = use_temp_hum = use_plant1 = use_plant2 = use_dist = False
 save_data = False
 baseline_duration_seconds = 10
+eeg_processing_mode = 'average'  # 'average' o 'individual'
 
 # Mostrar el menú inicial
 show_main_menu()
@@ -607,7 +618,16 @@ def midi_tick():
 # ---------------
 
 # --- Estados ---
+# Estructura para modo promedio (compatibilidad con v24)
 bands = {b: dict(rms=np.nan, env=0, signed_env=0.0, mu=MU_DEFAULTS.get(b, 1.0) if is_simulation else None, sd=SD_DEFAULTS.get(b, 1.0) if is_simulation else None, cc=0, buf=[]) for b in FILTS}
+
+# Estructura para modo multicanal (4 canales individuales del Muse 2)
+# Cada canal tiene sus propias bandas de frecuencia procesadas independientemente
+bands_per_channel = {
+    ch: {b: dict(rms=np.nan, env=0, signed_env=0.0, mu=None, sd=None, cc=0, buf=[]) for b in FILTS}
+    for ch in EEG_CHANNELS
+}
+
 acc = {'x':0.0, 'y':0.0, 'z':0.0}
 acc_baseline = {'x': 0.0, 'y': 0.0, 'z': 0.0}  # ← Posición neutral
 acc_rng = {a: dict(min=None, max=None, values=[]) for a in acc}  # ← values[] para capturar datos del baseline
@@ -619,6 +639,7 @@ baseline_acc_z = {'neutral': None, 'min': None, 'max': None, 'range': None, 'sig
 
 # Baseline EEG para exportar a CSV y TouchDesigner
 baseline_eeg_values = {}  # {band: {'mu': X, 'sigma': Y, 'min': Z, 'max': W}}
+baseline_eeg_values_per_channel = {ch: {} for ch in EEG_CHANNELS}  # Baseline por canal
 
 bio = {k: dict(raw=None, env=0, mu=None, amp=None, min=None, max=None, sum=0, cnt=0, cc=0) for k in ('plant1', 'plant2', 'myo')}
 
@@ -631,7 +652,9 @@ gyro = dict(x=0.0, y=0.0, z=0.0, cc=0)  # Giróscopo
 jaw = dict(clenched=0, cc=0)  # Jaw clench detection
 # use_ppg, use_gyro, use_jaw se inicializan en línea 116 (antes del menú)
 
-eeg_buf = deque(maxlen=WIN)
+# Buffer de EEG - un buffer por canal para modo multicanal
+eeg_buf = deque(maxlen=WIN)  # Modo promedio (compatibilidad)
+eeg_buf_per_channel = {ch: deque(maxlen=WIN) for ch in EEG_CHANNELS}  # Modo multicanal
 
 # --- Tracking de eventos de baseline para evitar envíos duplicados ---
 baseline_eeg_start_sent = False
@@ -735,16 +758,25 @@ def line_pre():
 def line_post():
     parts=[]; mode = "SIM" if is_simulation else "REAL"
     if use_eeg:
-        for b in bands:
-            signed = bands[b].get('signed_env',0.0)
-            env = bands[b].get('env',0.0)
-            cc = bands[b].get('cc',0)
-            r = bands[b].get('rms', None)
-            if isinstance(r, (int,float)) and not math.isnan(r):
-                r_str = f"{r:.3f}"
-            else:
-                r_str = "nan"
-            parts.append(f"{b}:{signed:+.2f}({env:.2f}) r={r_str}→{cc:3d}")
+        if eeg_processing_mode == 'individual':
+            # Mostrar promedio de los 4 canales para compactar display
+            for band_name in FILTS:
+                avg_signed = sum(bands_per_channel[ch][band_name].get('signed_env', 0) for ch in EEG_CHANNELS) / 4
+                avg_env = sum(bands_per_channel[ch][band_name].get('env', 0) for ch in EEG_CHANNELS) / 4
+                avg_rms = sum(bands_per_channel[ch][band_name].get('rms', 0) for ch in EEG_CHANNELS) / 4
+                avg_cc = sum(bands_per_channel[ch][band_name].get('cc', 0) for ch in EEG_CHANNELS) / 4
+                parts.append(f"{band_name}:{avg_signed:+.2f}({avg_env:.2f}) r={avg_rms:.3f}→{int(avg_cc):3d}")
+        else:
+            for b in bands:
+                signed = bands[b].get('signed_env',0.0)
+                env = bands[b].get('env',0.0)
+                cc = bands[b].get('cc',0)
+                r = bands[b].get('rms', None)
+                if isinstance(r, (int,float)) and not math.isnan(r):
+                    r_str = f"{r:.3f}"
+                else:
+                    r_str = "nan"
+                parts.append(f"{b}:{signed:+.2f}({env:.2f}) r={r_str}→{cc:3d}")
     if use_acc:
         if baseline_done:
             for a in acc:
@@ -782,26 +814,130 @@ def line_post():
 
 # --- Handlers y Parse (Solo modo real) ---
 def muse_eeg(_, *vals):
+    """Handler EEG - Soporta modo promedio y multicanal (4 canales)
+    Muse envía mensajes con:
+    - 1 valor: modo promedio
+    - 4 valores: [TP9, AF7, AF8, TP10]
+    - 6 valores: [TP9, AF7, AF8, TP10, AUX_LEFT, AUX_RIGHT] - formato Muse 2
+    """
     if not use_eeg or is_simulation: return
     global frames_left, baseline_done, baseline_eeg_done
     
-    # Debug solo si está activado
     if debug_mode and baseline_done and len(vals) > 0:
-        print(f"[EEG DEBUG] Recibido {len(vals)} valores.")
+        print(f"[EEG DEBUG] Recibido {len(vals)} valores, modo: {eeg_processing_mode}")
     
     if len(vals) == 0:
         if baseline_done:
             print(f"[EEG] ⚠️ Sin datos recibidos")
         return
     
+    # Detectar si tenemos datos multicanal: 4 o 6 valores
+    if (len(vals) == 4 or len(vals) == 6) and eeg_processing_mode == 'individual':
+        # Procesar multicanal: usar los primeros 4 valores (canales principales)
+        process_eeg_multichannel(vals[:4])  # TP9, AF7, AF8, TP10
+    
+    # Siempre procesar también el promedio (compatible con v24)
+    # para evitar duplicar lógica y permitir envío de datos en todos los modos
     valid_vals = [v for v in vals if not (v is None or (isinstance(v, float) and math.isnan(v)))]
     if not valid_vals:
         if baseline_done:
-            print(f"[EEG] ⚠️ Todos los valores son NaN - revisar conexión Muse")
+            print(f"[EEG] ⚠️ Todos los valores son NaN")
         return
-    
     mean_val = float(np.mean(valid_vals))
     eeg_buf.append(mean_val)
+    process_eeg_average()
+
+def process_eeg_multichannel(vals):
+    """Procesa 4 canales EEG individuales del Muse 2
+    vals = [tp9_sample, af7_sample, af8_sample, tp10_sample]
+    Cada llamada agrega UNA muestra por canal
+    """
+    global frames_left, baseline_done, baseline_eeg_done, baseline_eeg_start_sent
+    
+    if len(vals) != 4:
+        print(f"⚠️ Esperaba 4 valores, recibí {len(vals)}")
+        return
+    
+    # Agregar un sample por canal
+    for idx, ch_name in enumerate(EEG_CHANNELS):
+        sample_val = vals[idx]
+        if sample_val is not None and not (isinstance(sample_val, float) and math.isnan(sample_val)):
+            eeg_buf_per_channel[ch_name].append(float(sample_val))
+    
+    # Verificar si tenemos suficientes muestras (WIN samples)
+    all_ready = all(len(eeg_buf_per_channel[ch]) >= WIN for ch in EEG_CHANNELS)
+    if not all_ready:
+        return  # Seguir acumulando samples
+    
+    # Procesar cada canal con ventana completa
+    channel_results = {}
+    for ch_name in EEG_CHANNELS:
+        seg = np.array(eeg_buf_per_channel[ch_name])
+        ch_env = []
+        ch_signed = []
+        ch_raw = []
+        
+        try:
+            for band_name, filt in FILTS.items():
+                r = band_rms(seg, filt)
+                bands_per_channel[ch_name][band_name]['rms'] = r
+                ch_raw.append(float(r) if (r is not None and not math.isnan(r)) else float('nan'))
+                
+                if not baseline_done:
+                    if r is not None and not math.isnan(r):
+                        bands_per_channel[ch_name][band_name]['buf'].append(r)
+                else:
+                    mu = bands_per_channel[ch_name][band_name]['mu']
+                    sd = bands_per_channel[ch_name][band_name]['sd']
+                    if mu is None or sd is None: continue
+                    
+                    prev_signed = bands_per_channel[ch_name][band_name]['signed_env']
+                    if sd <= 1e-9 or r is None or math.isnan(r):
+                        signed_z = 0.0
+                    else:
+                        signed_z = (r - mu) / sd
+                    
+                    current_signed = ALPHA_ENV * signed_z + (1 - ALPHA_ENV) * prev_signed
+                    bands_per_channel[ch_name][band_name]['signed_env'] = current_signed
+                    current_env = abs(current_signed)
+                    bands_per_channel[ch_name][band_name]['env'] = current_env
+                    bands_per_channel[ch_name][band_name]['cc'] = scale(current_env, 0, Z_MAX)
+                    
+                    ch_env.append(current_env)
+                    ch_signed.append(current_signed)
+            
+            channel_results[ch_name] = {'env': ch_env, 'signed': ch_signed, 'raw': ch_raw}
+        except Exception as e:
+            print(f"Error procesando canal {ch_name}: {e}")
+    
+    # Enviar datos multicanal
+    if baseline_done:
+        try:
+            for ch_name in EEG_CHANNELS:
+                if ch_name in channel_results:
+                    ch_lower = ch_name.lower()
+                    if len(channel_results[ch_name]['env']) == 5:
+                        send_proc(f"/py/{ch_lower}/bands_env", channel_results[ch_name]['env'])
+                        send_proc(f"/py/{ch_lower}/bands_signed_env", channel_results[ch_name]['signed'])
+                        raw_fmt = [round(x,3) if not math.isnan(x) else 0.0 for x in channel_results[ch_name]['raw']]
+                        send_proc(f"/py/{ch_lower}/bands_raw", raw_fmt)
+        except Exception as e:
+            print(f"Error enviando OSC multicanal: {e}")
+    
+    # Baseline
+    if not baseline_done:
+        complete_baseline_phase()
+    
+    # Limpiar buffers
+    if STEP > 0:
+        for ch_name in EEG_CHANNELS:
+            for _ in range(min(STEP, len(eeg_buf_per_channel[ch_name]))):
+                if eeg_buf_per_channel[ch_name]:
+                    eeg_buf_per_channel[ch_name].popleft()
+
+def process_eeg_average():
+    """Procesa EEG en modo promedio (v24 compatible)"""
+    global frames_left, baseline_done, baseline_eeg_done, baseline_eeg_start_sent
     
     if len(eeg_buf) < WIN:
         return
@@ -809,7 +945,7 @@ def muse_eeg(_, *vals):
     seg = np.array(eeg_buf)
     osc_band_values_env = []
     osc_band_values_signed = []
-    osc_band_values_raw = []  # <-- nuevo: almacenar RMS raw
+    osc_band_values_raw = []
     
     try:
         for n, f in FILTS.items():
@@ -862,71 +998,10 @@ def muse_eeg(_, *vals):
         except Exception as e:
             print(f"!!! Error enviando OSC continuo: {e}")
     if not baseline_done and use_eeg:
-        # Enviar evento de inicio (solo una vez)
-        global baseline_eeg_start_sent
-        if not baseline_eeg_start_sent:
-            send_baseline_event("eeg", "start", BASE_SEC)
-            baseline_eeg_start_sent = True
-        
-        # usar frames_left (alias de frames_left_eeg)
-        frames_left -= 1
-        # Mostrar progreso del baseline de forma clara
-        total_frames = int(BASE_SEC / (STEP / SRATE))
-        frames_done = total_frames - frames_left
-        progress_pct = max(0, int((frames_done / max(1, total_frames)) * 100))
-        progress_bar = "█" * (progress_pct // 5) + "░" * (20 - progress_pct // 5)
-        tiempo_restante = max(0, BASE_SEC - (frames_done * STEP / SRATE))
-        
-        # Enviar progreso continuamente
-        send_baseline_event("eeg", "progress", progress_pct)
-        
-        sys.stdout.write(f"\r[BASELINE] {progress_bar} {progress_pct:3d}% | ⏱️  {tiempo_restante:5.1f}s restantes")
-        sys.stdout.flush()
-        
-        if frames_left <= 0:
-            sys.stdout.write("\n")  # Nueva línea para separar
-            baseline_mu_values = []; print("\n✨ Calculando baseline MU/SD/min/max...\n"); all_bands_valid = True
-            for n in bands:
-                arr = np.array(bands[n]['buf']);
-                if arr.size > 0: 
-                    bands[n]['mu']=mu_val=arr.mean()
-                    bands[n]['sd']=sd_val=arr.std() if arr.size>1 else 1e-9
-                    min_val = float(np.min(arr))
-                    max_val = float(np.max(arr))
-                    baseline_eeg_values[n] = {'mu': mu_val, 'sigma': sd_val, 'min': min_val, 'max': max_val}
-                    print(f"  ✓ {n:8s}: μ={mu_val:7.3f} σ={sd_val:7.3f} min={min_val:7.3f} max={max_val:7.3f} ({arr.size:4d} muestras)")
-                else: 
-                    print(f"  ⚠️ {n:8s}: SIN DATOS - usando valores por defecto")
-                    bands[n]['mu']=mu_val=1.0
-                    bands[n]['sd']=1e-9
-                    baseline_eeg_values[n] = {'mu': 1.0, 'sigma': 1e-9, 'min': 1.0, 'max': 1.0}
-                    all_bands_valid = False
-                bands[n]['buf']=[]; baseline_mu_values.append(mu_val)
+        complete_baseline_phase()
 
-            if all_bands_valid: print("\n✅ ¡Baseline EEG COMPLETADO! Entra en estado mental CALIBRADO")
-            else: print("\n⚠️ Baseline EEG con valores por defecto - revisar conexión Muse")
-
-            try:
-                if len(baseline_mu_values)==5: 
-                    print(f"\n📤 Enviando baseline a Processing: {[f'{x:.2f}' for x in baseline_mu_values]}")
-                    send_proc("/py/baseline_mu", baseline_mu_values, force=True)
-            except Exception as e: print(f"Error enviando MU: {e}")
             
-            # Enviar evento de término
-            send_baseline_event("eeg", "end")
-            baseline_eeg_start_sent = False
-            
-            # marcar done (alias y flag original)
-            baseline_eeg_done = True
-            baseline_done = True
-            # Si hay ACC, preparar contador de ACC baseline (frames_left_acc_neutral)
-            if use_acc:
-                print(f"\n🔄 Iniciando FASE 1: Posición Neutra ({baseline_acc_neutral_duration}s)...")
-                print("   ⚠️ MANTÉN TU CABEZA EN POSICIÓN NEUTRAL (sin movimiento)\n")
-            else:
-                print("✅ Baseline ACC (no seleccionado)")
-            
-    # No mostrar line_pre durante baseline con EEG (solo mostrar barra progreso)
+    # No mostrar line_pre durante baseline con EEG
     if use_eeg and not baseline_done: pass
     elif not (baseline_done and bio_done and dist_done):
         refresh(line_pre())
@@ -936,6 +1011,87 @@ def muse_eeg(_, *vals):
         for _ in range(STEP):
             if eeg_buf:
                 eeg_buf.popleft()
+
+def complete_baseline_phase():
+    """Completa la fase de baseline EEG (común para ambos modos)"""
+    global frames_left, baseline_done, baseline_eeg_done, baseline_eeg_start_sent
+    
+    if not baseline_eeg_start_sent:
+        send_baseline_event("eeg", "start", BASE_SEC)
+        baseline_eeg_start_sent = True
+    
+    frames_left -= 1
+    total_frames = int(BASE_SEC / (STEP / SRATE))
+    frames_done = total_frames - frames_left
+    progress_pct = max(0, int((frames_done / max(1, total_frames)) * 100))
+    progress_bar = "█" * (progress_pct // 5) + "░" * (20 - progress_pct // 5)
+    tiempo_restante = max(0, BASE_SEC - (frames_done * STEP / SRATE))
+    
+    send_baseline_event("eeg", "progress", progress_pct)
+    sys.stdout.write(f"\r[BASELINE] {progress_bar} {progress_pct:3d}% | ⏱️  {tiempo_restante:5.1f}s restantes")
+    sys.stdout.flush()
+    
+    if frames_left <= 0:
+        sys.stdout.write("\n")
+        print(f"\n✨ Calculando baseline (modo: {eeg_processing_mode.upper()})...\n")
+        
+        if eeg_processing_mode == 'individual':
+            # Baseline multicanal
+            for ch_name in EEG_CHANNELS:
+                print(f"📡 Canal {ch_name}:")
+                for band_name in FILTS:
+                    arr = np.array(bands_per_channel[ch_name][band_name]['buf'])
+                    if arr.size > 0:
+                        mu_val = arr.mean()
+                        sd_val = arr.std() if arr.size > 1 else 1e-9
+                        min_val = float(np.min(arr))
+                        max_val = float(np.max(arr))
+                        bands_per_channel[ch_name][band_name]['mu'] = mu_val
+                        bands_per_channel[ch_name][band_name]['sd'] = sd_val
+                        baseline_eeg_values_per_channel[ch_name][band_name] = {
+                            'mu': mu_val, 'sigma': sd_val, 'min': min_val, 'max': max_val
+                        }
+                        print(f"  ✓ {band_name:6s}: μ={mu_val:6.3f} σ={sd_val:6.3f} [{min_val:6.3f}, {max_val:6.3f}]")
+                        bands_per_channel[ch_name][band_name]['buf'] = []
+                    else:
+                        bands_per_channel[ch_name][band_name]['mu'] = 1.0
+                        bands_per_channel[ch_name][band_name]['sd'] = 1e-9
+                print()
+            print("✅ ¡Baseline MULTICANAL completado!")
+        else:
+            # Baseline promedio
+            baseline_mu_values = []
+            all_bands_valid = True
+            for n in bands:
+                arr = np.array(bands[n]['buf'])
+                if arr.size > 0:
+                    bands[n]['mu'] = mu_val = arr.mean()
+                    bands[n]['sd'] = sd_val = arr.std() if arr.size > 1 else 1e-9
+                    min_val = float(np.min(arr))
+                    max_val = float(np.max(arr))
+                    baseline_eeg_values[n] = {'mu': mu_val, 'sigma': sd_val, 'min': min_val, 'max': max_val}
+                    print(f"  ✓ {n:8s}: μ={mu_val:7.3f} σ={sd_val:7.3f} [{min_val:7.3f}, {max_val:7.3f}]")
+                else:
+                    bands[n]['mu'] = mu_val = 1.0
+                    bands[n]['sd'] = 1e-9
+                    baseline_eeg_values[n] = {'mu': 1.0, 'sigma': 1e-9, 'min': 1.0, 'max': 1.0}
+                    all_bands_valid = False
+                bands[n]['buf'] = []
+                baseline_mu_values.append(mu_val)
+            
+            if all_bands_valid:
+                print("\n✅ ¡Baseline EEG completado!")
+            if len(baseline_mu_values) == 5:
+                send_proc("/py/baseline_mu", baseline_mu_values, force=True)
+        
+        send_baseline_event("eeg", "end")
+        baseline_eeg_start_sent = False
+        baseline_eeg_done = True
+        baseline_done = True
+        
+        if use_acc:
+            print(f"\n🔄 Iniciando FASE ACC: Posición Neutra ({baseline_acc_neutral_duration}s)...")
+            print("   ⚠️ MANTÉN CABEZA EN POSICIÓN NEUTRAL\n")
 
 def muse_acc(_, x, y, z):
     if not use_acc or is_simulation: return
@@ -1456,27 +1612,78 @@ def close_dist():
 # ... (igual que v19) ...
 def simulation_loop():
     global baseline_done, bio_done, dist_done
-    print("\n--- Iniciando Modo Simulación ---"); baseline_done = True; bio_done = True; dist_done = True
+    print("\n--- Iniciando Modo Simulación ---")
+    print(f"Modo EEG: {eeg_processing_mode.upper()}")
+    baseline_done = True; bio_done = True; dist_done = True
     baseline_mu_values = [MU_DEFAULTS.get(b, 1.0) for b in FILTS]
-    try: print(f"Enviando Baseline MU (fijo): {[f'{x:.2f}' for x in baseline_mu_values]}"); send_proc("/py/baseline_mu", baseline_mu_values, force=True)
-    except Exception as e: print(f"Error enviando baseline MU simulado: {e}")
-    t_sim = 0.0; print(">>> ENTRANDO A BUCLE DE SIMULACIÓN <<<"); print("Simulación iniciada. Presiona Ctrl+C para detener.")
+    try:
+        send_proc("/py/baseline_mu", baseline_mu_values, force=True)
+    except Exception as e:
+        print(f"Error enviando baseline: {e}")
+    t_sim = 0.0
+    print("Simulación iniciada. Presiona Ctrl+C para detener.")
     while threads_active:
         try:
             row_start_time = time.time()
-            # 1. Generar signed_env
-            s_env_delta_sim=1.5*math.sin(0.2*t_sim+0.0); s_env_theta_sim=1.8*math.sin(0.4*t_sim+1.5); s_env_alpha_sim=2.0*math.sin(0.6*t_sim+3.0); s_env_beta_sim=1.5*math.sin(1.0*t_sim+4.5); s_env_gamma_sim=1.0*math.sin(1.5*t_sim+6.0)
-            osc_band_values_signed = [s_env_delta_sim, s_env_theta_sim, s_env_alpha_sim, s_env_beta_sim, s_env_gamma_sim]
-            # 2. Generar env
-            env_delta_sim=0.1+((math.sin(0.22*t_sim+0.2)+1.0)/2.0)*(Z_MAX-0.2); env_theta_sim=0.1+((math.sin(0.42*t_sim+1.7)+1.0)/2.0)*(Z_MAX-0.4); env_alpha_sim=0.1+((math.sin(0.62*t_sim+3.2)+1.0)/2.0)*(Z_MAX-0.5); env_beta_sim=0.1+((math.sin(1.02*t_sim+4.7)+1.0)/2.0)*(Z_MAX-1.0); env_gamma_sim=0.1+((math.sin(1.52*t_sim+6.2)+1.0)/2.0)*(Z_MAX-1.5)
-            osc_band_values_env = [env_delta_sim, env_theta_sim, env_alpha_sim, env_beta_sim, env_gamma_sim]
-            # 3. Generar ACC
-            accX_sim=0.8*math.sin(0.15*t_sim); accY_sim=0.6*math.cos(0.12*t_sim+1.0); accZ_sim=0.1*math.sin(0.08*t_sim+2.0); osc_acc_values = [accX_sim, accY_sim, accZ_sim]
-            # 4. Actualizar estado interno y MIDI
-            for i, n in enumerate(FILTS.keys()): bands[n]['signed_env'] = osc_band_values_signed[i]; bands[n]['env'] = osc_band_values_env[i]; bands[n]['cc'] = scale(bands[n]['env'], 0, Z_MAX); set_cc(n, bands[n]['cc'])
-            for i, a in enumerate(['x', 'y', 'z']): acc[a] = osc_acc_values[i]; set_cc('acc'+a, scale(acc[a], -1.0, 1.0))
+            # Generar datos
+            s_env_delta=1.5*math.sin(0.2*t_sim)
+            s_env_theta=1.8*math.sin(0.4*t_sim+1.5)
+            s_env_alpha=2.0*math.sin(0.6*t_sim+3.0)
+            s_env_beta=1.5*math.sin(1.0*t_sim+4.5)
+            s_env_gamma=1.0*math.sin(1.5*t_sim+6.0)
+            osc_signed = [s_env_delta, s_env_theta, s_env_alpha, s_env_beta, s_env_gamma]
+            env_delta=0.1+((math.sin(0.22*t_sim)+1.0)/2.0)*(Z_MAX-0.2)
+            env_theta=0.1+((math.sin(0.42*t_sim+1.7)+1.0)/2.0)*(Z_MAX-0.4)
+            env_alpha=0.1+((math.sin(0.62*t_sim+3.2)+1.0)/2.0)*(Z_MAX-0.5)
+            env_beta=0.1+((math.sin(1.02*t_sim+4.7)+1.0)/2.0)*(Z_MAX-1.0)
+            env_gamma=0.1+((math.sin(1.52*t_sim+6.2)+1.0)/2.0)*(Z_MAX-1.5)
+            osc_env = [env_delta, env_theta, env_alpha, env_beta, env_gamma]
+            accX=0.8*math.sin(0.15*t_sim)
+            accY=0.6*math.cos(0.12*t_sim+1.0)
+            accZ=0.1*math.sin(0.08*t_sim+2.0)
+            osc_acc = [accX, accY, accZ]
+            
+            # Actualizar estado
+            for i, n in enumerate(FILTS.keys()):
+                bands[n]['signed_env'] = osc_signed[i]
+                bands[n]['env'] = osc_env[i]
+                bands[n]['cc'] = scale(bands[n]['env'], 0, Z_MAX)
+                set_cc(n, bands[n]['cc'])
+            for i, a in enumerate(['x', 'y', 'z']):
+                acc[a] = osc_acc[i]
+                set_cc('acc'+a, scale(acc[a], -1.0, 1.0))
+            
+            # Generar valores raw simulados
+            osc_raw = [
+                MU_DEFAULTS.get('delta', 1.2) + 0.3*math.sin(0.25*t_sim),
+                MU_DEFAULTS.get('theta', 1.0) + 0.2*math.sin(0.45*t_sim+1.5),
+                MU_DEFAULTS.get('alpha', 1.0) + 0.25*math.sin(0.65*t_sim+3.0),
+                MU_DEFAULTS.get('beta', 0.8) + 0.15*math.sin(1.05*t_sim+4.5),
+                MU_DEFAULTS.get('gamma', 0.5) + 0.1*math.sin(1.55*t_sim+6.0)
+            ]
+            
             # 5. Enviar OSC
-            send_proc("/py/bands_signed_env", osc_band_values_signed); send_proc("/py/bands_env", osc_band_values_env); send_proc("/py/acc", osc_acc_values)
+            send_proc("/py/bands_signed_env", osc_signed, force=True)
+            send_proc("/py/bands_env", osc_env, force=True)
+            send_proc("/py/bands_raw", osc_raw, force=True)
+            send_proc("/py/acc", osc_acc, force=True)
+            
+            # Si modo multicanal, enviar también por canal
+            if eeg_processing_mode == 'individual':
+                for idx, ch_name in enumerate(EEG_CHANNELS):
+                    ch_lower = ch_name.lower()
+                    phase_offset = idx * 0.5
+                    ch_env = [
+                        0.1+((math.sin(0.22*t_sim+phase_offset)+1.0)/2.0)*(Z_MAX-0.2),
+                        0.1+((math.sin(0.42*t_sim+1.7+phase_offset)+1.0)/2.0)*(Z_MAX-0.4),
+                        0.1+((math.sin(0.62*t_sim+3.2+phase_offset)+1.0)/2.0)*(Z_MAX-0.5),
+                        0.1+((math.sin(1.02*t_sim+4.7+phase_offset)+1.0)/2.0)*(Z_MAX-1.0),
+                        0.1+((math.sin(1.52*t_sim+6.2+phase_offset)+1.0)/2.0)*(Z_MAX-1.5)
+                    ]
+                    ch_signed = [x * (1.0 if idx < 2 else -1.0) for x in ch_env]
+                    send_proc(f"/py/{ch_lower}/bands_env", ch_env, force=True)
+                    send_proc(f"/py/{ch_lower}/bands_signed_env", ch_signed, force=True)
+                    send_proc(f"/py/{ch_lower}/bands_raw", [round(x*1.5, 3) for x in ch_env], force=True)
             # 6. Imprimir estado
             refresh(line_post())
             # 7. Incrementar tiempo y esperar
